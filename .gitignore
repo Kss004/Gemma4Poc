@@ -17,7 +17,8 @@ backend/.pytest_cache/
 .vscode/
 
 # Project specifics
-backend/data/
-backend/uploads/
+**/data/
+**/uploads/
 *.gguf
+.DS_Store
 .DS_Store
