@@ -3,82 +3,132 @@ from __future__ import annotations
 import threading
 from typing import Dict, Iterator, List, Optional
 
-from huggingface_hub import hf_hub_download
-from llama_cpp import Llama
+import lmstudio as lms
+from lmstudio import (
+    LMStudioModelNotFoundError,
+    LMStudioWebsocketError,
+    LlmPredictionConfigDict,
+)
 
 from .config import (
-    GGUF_FILE,
-    GGUF_REPO,
+    LMS_MODEL_KEY,
     MAX_NEW_TOKENS,
     N_CTX,
-    N_GPU_LAYERS,
-    N_THREADS,
     TEMPERATURE,
     TOP_K,
     TOP_P,
 )
 
 
-class ModelService:
-    def __init__(self) -> None:
-        model_path = hf_hub_download(repo_id=GGUF_REPO, filename=GGUF_FILE)
-        kwargs = dict(
-            model_path=model_path,
-            n_ctx=N_CTX,
-            n_gpu_layers=N_GPU_LAYERS,
-            verbose=False,
-        )
-        if N_THREADS:
-            kwargs["n_threads"] = N_THREADS
-        try:
-            self._llm = Llama(**kwargs)
-        except ValueError as e:
-            if "Failed to load model from file" in str(e):
-                import sys
-                print("\n=======================================================\n", file=sys.stderr)
-                print(f"CRITICAL ERROR: Failed to load GGUF file.", file=sys.stderr)
-                print(f"The downloaded file might be corrupted.", file=sys.stderr)
-                print(f"Please delete the cache at:", file=sys.stderr)
-                print(f"  {model_path}", file=sys.stderr)
-                print(f"and restart the app to download it again.", file=sys.stderr)
-                print("\n=======================================================\n", file=sys.stderr)
-            raise
-        self._lock = threading.Lock()
+class ModelNotProvisionedError(RuntimeError):
+    """Raised when the requested model key is not registered with LM Studio."""
 
-    def _sampling(self, **overrides) -> Dict:
-        params = dict(
-            temperature=TEMPERATURE,
-            top_p=TOP_P,
-            top_k=TOP_K,
-            max_tokens=MAX_NEW_TOKENS,
-        )
-        params.update({k: v for k, v in overrides.items() if v is not None})
-        return params
+
+class DaemonUnreachableError(RuntimeError):
+    """Raised when the LM Studio daemon cannot be reached."""
+
+
+def _build_chat(messages: List[Dict[str, str]]) -> lms.Chat:
+    """Convert OpenAI-style role/content messages into an lmstudio Chat."""
+    chat = lms.Chat()
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if role == "system":
+            chat.add_system_prompt(content)
+        elif role == "user":
+            chat.add_user_message(content)
+        elif role == "assistant":
+            chat.add_assistant_response(content)
+        else:
+            raise ValueError(f"Unsupported message role: {role!r}")
+    return chat
+
+
+class ModelService:
+    """Thin wrapper over the lmstudio Python SDK.
+
+    Uses the SDK's auto / convenience mode (``lms.llm(...)``), which delegates
+    model lifecycle to the LM Studio daemon. The daemon must be running
+    (``lms daemon up``) and the referenced model must already be registered
+    (``lms import <gguf>`` or ``lms get <repo>``).
+
+    The model handle is acquired lazily on the first call to
+    :meth:`generate` or :meth:`stream`, so the backend process can start
+    even when the daemon is temporarily unreachable.
+    """
+
+    def __init__(self) -> None:
+        if not LMS_MODEL_KEY:
+            raise RuntimeError(
+                "LMS_MODEL_KEY is not set. Run `lms ls` to see available models "
+                "and export LMS_MODEL_KEY=<key> before starting the backend."
+            )
+        self._lock = threading.Lock()
+        self._llm: Optional[lms.LLM] = None
+
+    def _get_llm(self) -> lms.LLM:
+        if self._llm is not None:
+            return self._llm
+        load_config = {"contextLength": N_CTX}
+        try:
+            self._llm = lms.llm(LMS_MODEL_KEY, config=load_config)
+        except LMStudioWebsocketError as exc:
+            raise DaemonUnreachableError(
+                "Cannot reach the LM Studio daemon. Start it with `lms daemon up` "
+                "and try again."
+            ) from exc
+        except LMStudioModelNotFoundError as exc:
+            try:
+                available = [m.model_key for m in lms.list_downloaded_models()]
+            except Exception:
+                available = []
+            raise ModelNotProvisionedError(
+                f"Model {LMS_MODEL_KEY!r} is not registered with LM Studio. "
+                f"Available: {available or 'unknown (run `lms ls`)'}. "
+                "Register it with `lms import <path-to-gguf>` or `lms get <repo>`."
+            ) from exc
+        return self._llm
+
+    def _prediction_config(
+        self, max_tokens: Optional[int] = None
+    ) -> LlmPredictionConfigDict:
+        return {
+            "temperature": TEMPERATURE,
+            "topPSampling": TOP_P,
+            "topKSampling": TOP_K,
+            "maxTokens": max_tokens if max_tokens is not None else MAX_NEW_TOKENS,
+        }
 
     def generate(
         self,
         messages: List[Dict[str, str]],
         max_tokens: Optional[int] = None,
     ) -> str:
+        """Return a full assistant response for the given message history."""
+        chat = _build_chat(messages)
         with self._lock:
-            out = self._llm.create_chat_completion(
-                messages=messages,
-                stream=False,
-                **self._sampling(max_tokens=max_tokens),
+            llm = self._get_llm()
+            result = llm.respond(
+                chat,
+                config=self._prediction_config(max_tokens),
             )
-        return out["choices"][0]["message"]["content"].strip()
+        return result.content.strip()
 
     def stream(
         self,
         messages: List[Dict[str, str]],
         max_tokens: Optional[int] = None,
     ) -> Iterator[str]:
+        """Yield response fragments as they arrive from the model."""
+        chat = _build_chat(messages)
         with self._lock:
-            for chunk in self._llm.create_chat_completion(
-                messages=messages,
-                stream=True,
-                **self._sampling(max_tokens=max_tokens),
-            ):
-                delta = chunk["choices"][0].get("delta", {}).get("content")
-                if delta:
-                    yield delta
+            llm = self._get_llm()
+            prediction_stream = llm.respond_stream(
+                chat,
+                config=self._prediction_config(max_tokens),
+            )
+            for fragment in prediction_stream:
+                text = fragment.content
+                if text:
+                    yield text

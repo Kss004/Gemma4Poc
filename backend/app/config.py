@@ -10,12 +10,9 @@ DOCS_DIR = os.path.join(DATA_DIR, "docs")
 UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
 DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "chat.db"))
 
-GGUF_REPO = os.getenv("GGUF_REPO", "unsloth/gemma-4-E2B-it-GGUF")
-GGUF_FILE = os.getenv("GGUF_FILE", "gemma-4-E2B-it-Q4_K_M.gguf")
+LMS_MODEL_KEY = os.getenv("LMS_MODEL_KEY", "gemma-4-e2b-it")
 
 N_CTX = int(os.getenv("N_CTX", "8192"))
-N_THREADS = int(os.getenv("N_THREADS", "0")) or None
-N_GPU_LAYERS = int(os.getenv("N_GPU_LAYERS", "-1"))
 
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "512"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.7"))
