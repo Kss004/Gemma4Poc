@@ -22,3 +22,9 @@ backend/.pytest_cache/
 *.gguf
 .DS_Store
 .DS_Store
+
+# Local run logs / pids
+*.log
+*.pid
+backend/server.*
+frontend/dev.*
